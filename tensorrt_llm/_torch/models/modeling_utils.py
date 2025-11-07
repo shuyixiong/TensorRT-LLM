@@ -557,7 +557,8 @@ class DecoderModelForCausalLM(nn.Module,
     def load_weights(self,
                      weights: Dict,
                      weight_mapper: Optional["BaseWeightMapper"] = None,
-                     skip_modules: List[str] = []):
+                     skip_modules: List[str] = [],
+                     allow_partial_load: bool = False):
         # TODO smor- this solution is a temporary solution to load weights while we are still using
         # the old checkpoint format loading process. Once checkpoint format is unified
         # this method will be removed.
@@ -566,13 +567,15 @@ class DecoderModelForCausalLM(nn.Module,
             _load_weights_impl(self,
                                weights,
                                skip_modules,
-                               preload_weight_modules=preload_weight_modules)
+                               preload_weight_modules=preload_weight_modules
+                               allow_partial_load=allow_partial_load)
         else:
             _load_weights_impl_v2(self,
                                   weights,
                                   weight_mapper,
                                   skip_modules,
-                                  preload_weight_modules=preload_weight_modules)
+                                  preload_weight_modules=preload_weight_modules,
+                                  allow_partial_load=allow_partial_load)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -817,7 +820,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        weights: Dict,
                        skip_modules: List[str] = [],
                        params_map: Optional[Dict[str, str]] = None,
-                       preload_weight_modules: Optional[List[str]] = None):
+                       preload_weight_modules: Optional[List[str]] = None,
+                       allow_partial_load: bool = False):
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     # TODO smor- this method is here as a temporary solution to load weights.
@@ -867,12 +871,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
             if names[-1] == 'next_layer_layernorm':
                 return
             if names[-1] in params_map:
-                module_weights = []
+                module_weights = {}
                 for new_name in params_map[names[-1]]:
                     fw = filter_weights('.'.join(names[:-1] + [new_name]),
                                         weights)
-                    if not fw:
-                        continue
                     if new_name in ['k_proj', 'v_proj']:
                         num_kv_heads_list = [num_kv_heads
                                              ] * len(fw) if isinstance(
@@ -888,10 +890,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             for i, (k, v) in enumerate(fw.items())
                         }
 
-                    module_weights.append(fw)
+                    module_weights[new_name] = fw
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
                 if module_weights:
-                    module.load_weights(weights=module_weights)
+                    module.load_weights(weights=[module_weights])
 
             else:
                 module_weights = filter_weights(name, weights)
@@ -942,7 +944,8 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                           weight_mapper: "BaseWeightMapper",
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
-                          preload_weight_modules: Optional[List[str]] = None):
+                          preload_weight_modules: Optional[List[str]] = None,
+                          allow_partial_load: bool = False):
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)

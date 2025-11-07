@@ -5,7 +5,9 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Callable
+from collections import defaultdict
+from threading import Lock
 
 import torch
 import torch.nn.functional as F
@@ -30,6 +32,56 @@ from ...models.modeling_utils import QuantConfig
 from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import Fp4QuantizedTensor
+
+
+class WeightCache:
+    """
+    Efficient weight cache manager for partial loading
+    """
+    def __init__(self):
+        self._cache = defaultdict(dict)  # module_id -> {component: tensor}
+        self._expected_components = defaultdict(set)  # module_id -> set of expected components
+        
+    def set_expected_components(self, module_id: str, components: List[str]):
+        """set the expected components list for a module (q_weight, q_bias,...)"""
+        if module_id not in self._expected_components:
+            self._expected_components[module_id] = set(components)
+    
+    def cache_weight(self, module_id: str, weights: Dict, load_func: Callable) -> List[Optional[torch.Tensor]]:
+        """
+        cache the weight data, return all cached weights only when all components are ready
+        
+        Args:
+            module_id: the unique identifier of the module 
+            weights: a dict containing the weight and bias data
+            load_func: a function to load the weight and bias data
+            
+        Returns:
+            if all components are ready, return all cached weight tensors in the order of expected components; otherwise return None
+        """
+        
+        for name, weight_data in weights.items():
+            name = name.split('_')[0]
+            if 'weight' in weight_data:
+                self._cache[module_id][name + '_weight'] = load_func(weight_data['weight'])
+            if 'bias' in weight_data:
+                self._cache[module_id][name + '_bias'] = load_func(weight_data['bias'])
+        
+        # check if all components are cached
+        expected = self._expected_components[module_id]
+        cached_components = set(self._cache[module_id].keys())
+        
+        if cached_components == expected:
+            all_cached_weights = [self._cache[module_id][name] for name in expected]
+            del self._cache[module_id]
+            del self._expected_components[module_id]
+            return all_cached_weights
+        
+        return [None] * len(expected)
+    
+
+# Cache partial weights
+_weight_cache = WeightCache()
 
 
 class WeightMode(str, enum.Enum):
@@ -157,51 +209,83 @@ def load_weights_fused_qkv_helper(
     module: Linear,
     weights: List[Dict],
     weight_transform=lambda x: x,
-    bias_transform=lambda x: x
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    assert len(weights) == 3
+    bias_transform=lambda x: x,
+    allow_partial_load: bool = False
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    # Extract the original weights dict
+    weights = weights[0]
     device = torch.device('cuda')
-
-    q_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode, device)
-    k_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode, device)
-    v_weight = load_weight_shard(weights[2]['weight'], module.tp_size,
-                                 module.tp_rank, module.tp_mode, device)
-
-    if module.bias is not None:
-        q_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode, device)
-        k_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode, device)
-        v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
-                                   module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias,
+    if not allow_partial_load:
+        assert len(weights) == 3, "Expected qkv weights for full load"
+        q_weight = load_weight_shard(weights['q_proj']['weight'], module.tp_size,
+                                module.tp_rank, module.tp_mode, device)
+        k_weight = load_weight_shard(weights['k_proj']['weight'], module.tp_size,
+                                module.tp_rank, module.tp_mode, device)
+        v_weight = load_weight_shard(weights['v_proj']['weight'], module.tp_size,
+                                module.tp_rank, module.tp_mode, device)
+        if module.bias is not None:
+            q_bias = load_weight_shard(weights['q_proj']['bias'], module.tp_size,
+                                module.tp_rank, module.tp_mode, device)
+            k_bias = load_weight_shard(weights['k_proj']['bias'], module.tp_size,
+                                module.tp_rank, module.tp_mode, device)
+            v_bias = load_weight_shard(weights['v_proj']['bias'], module.tp_size,
+                                module.tp_rank, module.tp_mode, device)
+            copy_weight(module.bias,
                     bias_transform(torch.cat((q_bias, k_bias, v_bias))))
+        return tuple(map(weight_transform, (q_weight, k_weight, v_weight)))
+    
+    load_func = lambda weight: load_weight_shard(weight, module.tp_size, module.tp_rank, module.tp_mode, device)
+    if module.bias is not None:
+        _weight_cache.set_expected_components(id(module), ['q_weight', 'k_weight', 'v_weight', 'q_bias', 'k_bias', 'v_bias'])
+        expected_weights= _weight_cache.cache_weight(id(module), weights, load_func = load_func)
+        if expected_weights:
+            copy_weight(module.bias, bias_transform(torch.cat((expected_weights[3], expected_weights[4], expected_weights[5]))))
+    else:
+        _weight_cache.set_expected_components(id(module), ['q_weight', 'k_weight', 'v_weight'])
+        expected_weights= _weight_cache.cache_weight(id(module), weights, load_func = load_func)
 
-    return tuple(map(weight_transform, (q_weight, k_weight, v_weight)))
-
+    if expected_weights:
+        return tuple(map(weight_transform, (expected_weights[0], expected_weights[1], expected_weights[2])))
+    else:
+        return tuple([None] * 3)
 
 def load_weights_fused_gate_up_helper(
         module: Linear,
         weights: List[Dict],
         weight_transform=lambda x: x,
-        bias_transform=lambda x: x) -> tuple[torch.Tensor, torch.Tensor]:
-    assert len(weights) == 2
+        bias_transform=lambda x: x,
+        allow_partial_load: bool = False) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    weights = weights[0]
     device = torch.device('cuda')
-
-    gate_weight = load_weight_shard(weights[0]['weight'], module.tp_size,
+    if not allow_partial_load:
+        assert len(weights)==2, "Expected gate and up weights for full load"
+        gate_weight = load_weight_shard(weights['gate_proj']['weight'], module.tp_size,
                                     module.tp_rank, module.tp_mode, device)
-    up_weight = load_weight_shard(weights[1]['weight'], module.tp_size,
+        up_weight = load_weight_shard(weights['up_proj']['weight'], module.tp_size,
                                   module.tp_rank, module.tp_mode, device)
-    if module.bias is not None:
-        gate_bias = load_weight_shard(weights[0]['bias'], module.tp_size,
+        if module.bias is not None:
+            gate_bias = load_weight_shard(weights['gate_proj']['bias'], module.tp_size,
                                       module.tp_rank, module.tp_mode, device)
-        up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
+            up_bias = load_weight_shard(weights['up_proj']['bias'], module.tp_size,
                                     module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, bias_transform(torch.cat(
-            (gate_bias, up_bias))))
-    return tuple(map(weight_transform, (gate_weight, up_weight)))
+            copy_weight(module.bias, bias_transform(torch.cat(
+                (gate_bias, up_bias))))
+        return tuple(map(weight_transform, (gate_weight, up_weight)))
+
+    load_func = lambda weight: load_weight_shard(weight, module.tp_size, module.tp_rank, module.tp_mode, device)
+    if module.bias is not None:
+        _weight_cache.set_expected_components(id(module), ['gate_weight', 'up_weight', 'gate_bias', 'up_bias'])
+        expected_weights= _weight_cache.cache_weight(id(module), weights, load_func = load_func)
+        if expected_weights:
+            copy_weight(module.bias, bias_transform(torch.cat(
+                (expected_weights[3], expected_weights[4]))))
+    else:
+        _weight_cache.set_expected_components(id(module), ['gate_weight', 'up_weight'])
+        expected_weights= _weight_cache.cache_weight(id(module), weights, load_func = load_func)
+    if expected_weights:
+        return tuple(map(weight_transform, (expected_weights[0], expected_weights[1])))
+    else:
+        return tuple([None] * 2)
 
 
 def get_weight_dtype_and_id(module: Linear) -> tuple[torch.dtype, int]:
@@ -242,16 +326,17 @@ class LinearMethodBase(ABC):
         raise NotImplementedError
 
     def load_weights(self, module: Linear, weights: List[Dict],
-                     weight_mode: WeightMode):
+                     weight_mode: WeightMode,
+                     allow_partial_load: bool = False):
         """
         Load weights from the checkpoint.
         """
         if weight_mode == WeightMode.VANILLA:
             self.load_weights_vanilla(module, weights)
         elif weight_mode == WeightMode.FUSED_QKV_LINEAR:
-            self.load_weights_fused_qkv_linear(module, weights)
+            self.load_weights_fused_qkv_linear(module, weights, allow_partial_load=allow_partial_load)
         elif weight_mode == WeightMode.FUSED_GATE_UP_LINEAR:
-            self.load_weights_fused_gate_up_linear(module, weights)
+            self.load_weights_fused_gate_up_linear(module, weights, allow_partial_load=allow_partial_load)
         else:
             raise ValueError(f'unsupported weight mode: {weight_mode}')
 
@@ -272,7 +357,8 @@ class LinearMethodBase(ABC):
 
     @abstractmethod
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]) -> None:
+                                      weights: List[Dict],
+                                      allow_partial_load: bool = False) -> None:
         """
         Load weights for the FUSED_QKV_LINEAR weight mode.
         """
@@ -280,7 +366,8 @@ class LinearMethodBase(ABC):
 
     @abstractmethod
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]) -> None:
+                                          weights: List[Dict],
+                                          allow_partial_load: bool = False) -> None:
         """
         Load weights for the FUSED_GATE_UP_LINEAR weight mode.
         """
@@ -316,16 +403,20 @@ class UnquantizedLinearMethod(LinearMethodBase):
         load_weights_vanilla_helper(module, weights)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]) -> None:
+                                      weights: List[Dict],
+                                      allow_partial_load: bool = False) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
-            module, weights)
+            module, weights, allow_partial_load=allow_partial_load)
+        if q_weight is None or k_weight is None or v_weight is None:
+            return
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
         copy_weight(module.weight, fused_weight)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]) -> None:
+                                          weights: List[Dict],
+                                          allow_partial_load: bool = False) -> None:
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
-            module, weights)
+            module, weights, allow_partial_load=allow_partial_load)
         fused_weight = torch.cat((gate_weight, up_weight))
         copy_weight(module.weight, fused_weight)
 
@@ -430,10 +521,12 @@ class FP8QDQLinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, weight_scale[0])
 
     def load_weights_fused_qkv_linear(self, module: Linear,
-                                      weights: List[Dict]) -> None:
+                                      weights: List[Dict],
+                                      allow_partial_load: bool = False) -> None:
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
-            module, weights)
-
+            module, weights, allow_partial_load=allow_partial_load)
+        if q_weight is None or k_weight is None or v_weight is None:
+            return
         input_scale, weight_scale = self.load_weight_scales(weights)
         if len(input_scale) != 0:
             # Static quantization
@@ -471,7 +564,8 @@ class FP8QDQLinearMethod(LinearMethodBase):
                 module.inv_kv_scales.data = 1.0 / module.kv_scales
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
-                                          weights: List[Dict]) -> None:
+                                          weights: List[Dict],
+                                          allow_partial_load: bool = False) -> None:
         input_scale, weight_scale = self.load_weight_scales(weights)
         if len(input_scale) != 0:
             # Static quantization
@@ -482,7 +576,9 @@ class FP8QDQLinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, max(weight_scale))
 
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
-            module, weights)
+            module, weights, allow_partial_load=allow_partial_load)
+        if gate_weight is None or up_weight is None:
+            return
 
         # use in-place multiplication and division to avoid extra memory allocation
         gate_weight = gate_weight.to(module.dtype).mul_(weight_scale[0])
