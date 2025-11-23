@@ -145,6 +145,49 @@ def compare_logits(
             f"Prompt {i}: overlap ratio: {mean_ratio:.2%} is less than {threshold:.2%}"
         )
 
+
+def compare_logprobs_from_logits(logits_list, ref_logits_list, token_ids):
+    """
+    Compare logprobs computed from logits for each sampled token.
+    
+    Args:
+        logits_list: List[Tensor] - TensorRT-LLM logits, shape [num_tokens, vocab_size] per prompt
+        ref_logits_list: List[Tensor] - HF logits, shape [num_tokens, vocab_size] per prompt  
+        token_ids: List[Tensor] - Sampled token IDs, shape [num_tokens] per prompt
+    """
+    assert len(logits_list) == len(ref_logits_list) == len(token_ids)
+    
+    print("\n" + "="*80)
+    print("Comparing logprobs from logits (per token):")
+    print("="*80)
+    
+    for prompt_idx, (llm_logits, ref_logits, token_ids) in enumerate(zip(logits_list, ref_logits_list, token_ids)):
+        assert llm_logits.shape == ref_logits.shape, f"Shape mismatch: {llm_logits.shape} vs {ref_logits.shape}"
+        
+        # Convert logits to logprobs
+        llm_logprobs_full = torch.log_softmax(torch.tensor(llm_logits, device="cuda", dtype=torch.float32), dim=-1)
+        ref_logprobs_full = torch.log_softmax(ref_logits, dim=-1)
+        
+        # Extract logprobs for sampled tokens
+        num_tokens = len(token_ids)
+        
+        print(f"\nPrompt {prompt_idx}: {num_tokens} tokens")
+        print(f"{'Token':<6} {'ID':<8} {'min_diff':<15} {'max_diff':<15} {'mean_diff':<10} {'sample_token_diff':<10}")
+        print("-" * 64)
+        
+        for token_idx in range(num_tokens):
+            min_diff = abs(llm_logprobs_full[token_idx, :] - ref_logprobs_full[token_idx, :]).min().item()
+            max_diff = abs(llm_logprobs_full[token_idx, :] - ref_logprobs_full[token_idx, :]).max().item()
+            mean_diff = abs(llm_logprobs_full[token_idx, :] - ref_logprobs_full[token_idx, :]).mean().item()
+            tid = token_ids[token_idx].item()
+            
+            llm_sample_token_logprob = llm_logprobs_full[token_idx, tid].item()
+            ref_sample_token_logprob = ref_logprobs_full[token_idx, tid].item()
+            sample_token_diff = abs(llm_sample_token_logprob - ref_sample_token_logprob)
+            
+            print(f"{token_idx:<6} {tid:<8} {min_diff:<15.6f} {max_diff:<15.6f} {mean_diff:<10.6f} {sample_token_diff:<10.6f}")
+        
+        
 def compare_logprobs(logprobs_list, ref_new_token_logprobs_list):
     """
     logprobs_list: List[torch.Tensor] - LLM logprob values
@@ -155,13 +198,21 @@ def compare_logprobs(logprobs_list, ref_new_token_logprobs_list):
     assert len(logprobs_list) == len(ref_new_token_logprobs_list)
     
     # Compare logprobs for each prompt
+    print("\n" + "="*80)
+    print("Comparing API logprobs vs HF reference logprobs:")
+    print("="*80)
+    
     for i, (llm_logprobs_i, ref_logprobs_i) in enumerate(zip(logprobs_list, ref_new_token_logprobs_list)):
         # Compare logprobs - compute diff and report max/min/mean
-        logprobs_diff = llm_logprobs_i - ref_logprobs_i
+        logprobs_diff = abs(llm_logprobs_i - ref_logprobs_i)
         max_diff = logprobs_diff.max().item()
         min_diff = logprobs_diff.min().item()
         mean_diff = logprobs_diff.mean().item()
-        print(f"Prompt {i}: Logprobs diff - max: {max_diff:.6f}, min: {min_diff:.6f}, mean: {mean_diff:.6f}")
+        
+        print(f"\nPrompt {i}:")
+        print(f"  Max diff:  {max_diff:.6f}")
+        print(f"  Min diff:  {min_diff:.6f}")
+        print(f"  Mean diff: {mean_diff:.6f}")
 
 
 def run_generate(llm, hf_model, prompts, sampling_params):
@@ -215,7 +266,7 @@ def test_llm_update_weights(model_dir):
         "The future of AI is",
     ]
 
-    sampling_params = SamplingParams(temperature=1, return_generation_logits=True, logprobs=1)
+    sampling_params = SamplingParams(temperature=0, return_generation_logits=True, logprobs=1)
 
     # ipc_handles = hf_model.get_weight_ipc_handles([0])
 
@@ -237,7 +288,10 @@ def test_llm_update_weights(model_dir):
     
 
     print("--------------------------------tp1 vs hf--------------------------------")
-    # compare_logits(llm_logits_tp1, ref_logits)
+    compare_logits(llm_logits_tp1, ref_logits)
+    # Compare logprobs computed from logits
+    compare_logprobs_from_logits(llm_logits_tp1, ref_logits, llm_new_token_ids_tp1)
+    # Compare API returned logprobs vs HF logprobs
     compare_logprobs(llm_logprobs_tp1, ref_new_token_logprobs)
 
     del llm_tp1
@@ -271,6 +325,7 @@ def test_llm_update_weights(model_dir):
     
     print("--------------------------------tp2 vs hf--------------------------------")
     # compare_logits(llm_logits_tp2, ref_logits)
+    compare_logprobs_from_logits(llm_logits_tp2, ref_logits, llm_new_token_ids_tp2)
     compare_logprobs(llm_logprobs_tp2, ref_new_token_logprobs)
 
     # print("--------------------------------tp1 vs tp2--------------------------------")  
