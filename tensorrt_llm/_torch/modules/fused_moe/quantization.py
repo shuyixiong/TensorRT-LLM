@@ -473,21 +473,19 @@ class FusedMoEMethodBase(ABC):
             TensorParallelMode.COLUMN,
             device=device) if w3_weight is not None else None
 
-        src_w3_size_shard = w3_weight_shard.shape[
-            0] if w3_weight_shard is not None else 0
-        src_w1_size_shard = w1_weight_shard.shape[
-            0] if w1_weight_shard is not None else 0
-        if w1_weight is not None:
-            dst_w1_weight = dst_w3_w1_weight.narrow(dim=0,
-                                                    start=src_w3_size_shard,
-                                                    length=src_w1_size_shard)
-            dst_w1_weight.copy_(w1_weight_shard.contiguous().view(
-                dst_w3_w1_weight.dtype),
-                                non_blocking=True)
-        if w3_weight is not None:
-            dst_w3_weight = dst_w3_w1_weight.narrow(dim=0,
-                                                    start=0,
-                                                    length=src_w3_size_shard)
+        dst_w3_weight, dst_w1_weight = dst_w3_w1_weight.chunk(2, dim=0)
+        if w1_weight_shard is not None and w1_weight_shard.shape[0] != 0:
+            w1_weight_shard_viewed = w1_weight_shard.contiguous().view(
+                dst_w3_w1_weight.dtype)
+            if w1_weight_shard_viewed.shape[0] == dst_w3_w1_weight.shape[0]:
+                # w3_weight (gate_proj) should be empty for Nemotron-H MoE model.
+                dst_w3_w1_weight.copy_(w1_weight_shard_viewed,
+                                       non_blocking=True)
+            elif w1_weight_shard_viewed.shape[0] == dst_w1_weight.shape[0]:
+                dst_w1_weight.copy_(w1_weight_shard_viewed, non_blocking=True)
+            else:
+                raise ValueError("Shape mismatch!")
+        if w3_weight_shard is not None and w3_weight_shard.shape[0] != 0:
             dst_w3_weight.copy_(w3_weight_shard.contiguous().view(
                 dst_w3_w1_weight.dtype),
                                 non_blocking=True)
