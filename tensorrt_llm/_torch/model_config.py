@@ -470,23 +470,33 @@ class ModelConfig(Generic[TConfig]):
         # Some checkpoints lack torch_dtype, populate with dtype
         pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
                                                 None)
-        quant_config = QuantConfig()
         layer_quant_config = None
-        moe_backend = kwargs.get('moe_backend', 'CUTLASS')
+        if getattr(kwargs.get('quant_config'), '_override_quant_algo', False):
+            quant_config = kwargs['quant_config']
+            logger.warning(
+                "QuantConfig is set explicitly, ignoring the quant_config from HF quant config."
+            )
+        else:
+            quant_config = QuantConfig()
+            moe_backend = kwargs.get('moe_backend', 'CUTLASS')
 
-        # quantized ckpt in modelopt format
-        if quant_config_file := cached_file(checkpoint_dir,
-                                            'hf_quant_config.json'):
-            quant_config, layer_quant_config = cls.load_modelopt_quant_config(
-                quant_config_file, checkpoint_dir, moe_backend)
-        # quantized ckpt in other formats
-        elif hasattr(pretrained_config, "quantization_config"):
-            hf_quant_config = pretrained_config.quantization_config
-            quant_config, layer_quant_config = cls.load_hf_quant_config(
-                hf_quant_config, moe_backend)
-        elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
-            quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
-                quant_config_file, moe_backend)
+            # quantized ckpt in modelopt format
+            if quant_config_file := cached_file(checkpoint_dir,
+                                                'hf_quant_config.json'):
+                quant_config, layer_quant_config = cls.load_modelopt_quant_config(
+                    quant_config_file, checkpoint_dir, moe_backend)
+            # quantized ckpt in other formats
+            elif hasattr(pretrained_config, "quantization_config"):
+                hf_quant_config = pretrained_config.quantization_config
+                quant_config, layer_quant_config = cls.load_hf_quant_config(
+                    hf_quant_config, moe_backend)
+            elif quant_config_file := cached_file(checkpoint_dir,
+                                                  'dtypes.json'):
+                quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
+                    quant_config_file, moe_backend)
+
+        # Remove quant_config from kwargs to avoid duplicate parameter error
+        kwargs.pop('quant_config', None)
 
         model_config = cls(pretrained_config=pretrained_config,
                            quant_config=quant_config,

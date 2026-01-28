@@ -2962,8 +2962,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
-    # PrivateVars
-    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+    quant_config: Optional[QuantConfig] = Field(
+        default=None,
+        description=
+        "Quantization config for PyTorch backend. Can be a QuantConfig object, a dict. Only used with load_format='dummy'.",
+        status="prototype",
+        validate_default=True)
 
     disable_flashinfer_sampling: bool = Field(
         default=False,
@@ -2977,16 +2981,6 @@ class TorchLlmArgs(BaseLlmArgs):
         description="The max number of performance statistic entries.",
         status="prototype",
     )
-
-    @property
-    def quant_config(self) -> QuantConfig:
-        if self._quant_config is None:
-            self._quant_config = QuantConfig()
-        return self._quant_config
-
-    @quant_config.setter
-    def quant_config(self, value: QuantConfig):
-        self._quant_config = value
 
     # TODO: remove backend later
     @field_validator('backend', mode='before')
@@ -3004,6 +2998,38 @@ class TorchLlmArgs(BaseLlmArgs):
         if load_format not in LoadFormat.__members__:
             raise ValueError(f"Invalid LoadFormat: {v}")
         return LoadFormat[load_format]
+
+    @field_validator('quant_config', mode='before')
+    @classmethod
+    def convert_quant_config(cls, v):
+        """Load quant_config from various sources.
+
+        Supports:
+        - QuantConfig object: pass through
+        - dict: convert to QuantConfig
+        - None: create default QuantConfig
+        """
+        if isinstance(v, QuantConfig):
+            setattr(v, '_override_quant_algo', True)
+            return v
+        elif isinstance(v, dict):
+            quant_config = QuantConfig.from_dict(v)
+            setattr(quant_config, '_override_quant_algo', True)
+            return quant_config
+        elif v is None:
+            return QuantConfig()
+        else:
+            raise TypeError(
+                f"quant_config must be QuantConfig, dict, or None, got {type(v)}"
+            )
+
+    @model_validator(mode='after')
+    def validate_quant_config(self):
+        if getattr(self.quant_config, '_override_quant_algo',
+                   False) and self.load_format != LoadFormat.DUMMY:
+            raise ValueError(
+                "quant_config is only supported for load_format='dummy'")
+        return self
 
     # Extra resource managers to use in addition to the KV cache manager.
     # Each manager's prepare_resources method is called before the forward pass,

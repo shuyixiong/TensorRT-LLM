@@ -669,13 +669,15 @@ class CachedModelLoader:
             self._hf_model_dir = self._download_hf_model_if_needed(
                 self.model_loader.model_obj, revision=self.llm_args.revision)
 
-            if self.llm_args.quant_config.quant_algo is not None:
-                logger.warning(
-                    "QuantConfig for pytorch backend is ignored. You can load"
-                    "quantized model with hf_quant_config.json directly.")
-            # Currently, this is to make updated quant_config visible by llm.args.quant_config
             # TODO: Unify the logics with those in tensorrt_llm/_torch/model_config.py
-            self.model_loader._update_from_hf_quant_config()
+            if getattr(self.llm_args.quant_config, '_override_quant_algo',
+                       False):
+                logger.warning(
+                    "QuantConfig is set explicitly, ignoring the quant_config from HF quant config."
+                )
+            else:
+                # Currently, this is to make updated quant_config visible by llm.args.quant_config
+                self.model_loader._update_from_hf_quant_config()
 
             return None, self._hf_model_dir
 

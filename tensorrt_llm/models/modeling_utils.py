@@ -155,6 +155,17 @@ class QuantConfig:
     exclude_modules: Optional[List[str]] = None
     mamba_ssm_cache_dtype: Optional[str] = None
 
+    def __post_init__(self):
+        """Convert string values to QuantAlgo enum if necessary."""
+        # Convert quant_algo from string to QuantAlgo enum
+        if isinstance(self.quant_algo, str):
+            object.__setattr__(self, 'quant_algo', QuantAlgo(self.quant_algo))
+
+        # Convert kv_cache_quant_algo from string to QuantAlgo enum
+        if isinstance(self.kv_cache_quant_algo, str):
+            object.__setattr__(self, 'kv_cache_quant_algo',
+                               QuantAlgo(self.kv_cache_quant_algo))
+
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
         quant_mode_list = [
@@ -265,10 +276,20 @@ class QuantConfig:
     def to_dict(self) -> dict:
         """Dump a QuantConfig instance to a dict.
 
+        Note:
+            quant_algo and kv_cache_quant_algo will be serialized as strings
+            to ensure compatibility with JSON and other serialization formats.
+
         Returns:
-            dict: The dict dumped from QuantConfig.
+            dict: The dict dumped from QuantConfig, with enum values as strings.
         """
-        return dataclasses.asdict(self)
+        result = dataclasses.asdict(self)
+        # Convert QuantAlgo enums to strings for better serialization
+        if isinstance(result.get('quant_algo'), QuantAlgo):
+            result['quant_algo'] = str(result['quant_algo'])
+        if isinstance(result.get('kv_cache_quant_algo'), QuantAlgo):
+            result['kv_cache_quant_algo'] = str(result['kv_cache_quant_algo'])
+        return result
 
 
 @dataclasses.dataclass

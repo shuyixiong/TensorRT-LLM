@@ -272,3 +272,52 @@ def test_llm_partial_update_weights(model_dir):
 
         llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
         compare_logits(llm_logits, ref_logits)
+
+
+@pytest.mark.parametrize(
+    "model_dir, fp8_model_dir",
+    [
+        ("Qwen3/Qwen3-8B", "Qwen3/Qwen3-8B-FP8"),
+        ("Qwen3/Qwen3-30B-A3B", "Qwen3/Qwen3-30B-A3B-FP8"),
+    ],
+)
+def test_llm_update_weights_with_quant_config(model_dir, fp8_model_dir):
+    model_dir = str(llm_models_root() / model_dir)
+    fp8_model_dir = str(llm_models_root() / fp8_model_dir)
+    with TemporaryDirectory() as tmp_model_dir:
+        num_hidden_layers = 1
+        process_and_copy_folder(model_dir, tmp_model_dir, num_hidden_layers=num_hidden_layers)
+        hf_model = RefHFModelWithIPCHandles(fp8_model_dir, num_hidden_layers=num_hidden_layers)
+        tokenizer = AutoTokenizer.from_pretrained(fp8_model_dir)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True, free_gpu_memory_fraction=0.1)
+        llm = LLM(
+            model=tmp_model_dir,
+            ray_worker_extension_cls="tensorrt_llm.llmapi.rlhf_utils.WorkerExtension",
+            tensor_parallel_size=1,
+            load_format="dummy",
+            pipeline_parallel_size=1,
+            kv_cache_config=kv_cache_config,
+            quant_config={"quant_algo": "FP8_BLOCK_SCALES"},
+        )
+
+        # Generate texts from the prompts.
+        prompts_texts = [
+            "Hello, my name is",
+            "The president of the United States is",
+            "The capital of France is",
+            "The future of AI is",
+        ]
+        prompts = [tokenizer.encode(prompt) for prompt in prompts_texts]
+        del tokenizer
+        sampling_params = SamplingParams(
+            temperature=0, return_generation_logits=True, max_tokens=1024
+        )
+
+        ipc_handles = hf_model.get_weight_ipc_handles_serialized([0])
+
+        llm._collective_rpc("update_weights", (ipc_handles,))
+        # Finalize the update weights
+        llm._collective_rpc("update_weights", (None,))
+
+        llm_logits, ref_logits = run_generate(llm, hf_model, prompts, sampling_params)
+        compare_logits(llm_logits, ref_logits)
