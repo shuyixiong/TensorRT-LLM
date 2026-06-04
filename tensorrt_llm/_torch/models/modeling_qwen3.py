@@ -122,6 +122,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             overridden_tp_size=1 if self.enable_attention_dp else None,
             config=model_config,
             layer_idx=layer_idx,
+            use_cute_dsl_blockscaling_mm=model_config.use_cute_dsl_blockscaling_mm,
         )
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
