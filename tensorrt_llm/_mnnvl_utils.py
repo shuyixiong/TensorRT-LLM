@@ -374,7 +374,12 @@ class MnnvlMemory:
                     is_active = pynvml.nvmlDeviceGetNvLinkState(handle, link_idx)
                     if is_active:
                         active_links += 1
-            except pynvml.NVMLError_NotSupported:
+            except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_InvalidArgument):
+                # NVML_NVLINK_MAX_LINKS (36) is a compile-time upper bound, not the
+                # device's real link count. GB200/Blackwell returns InvalidArgument
+                # for link indices past its 18 real NVLinks (older archs return
+                # NotSupported). Both mean "no such link" -> skip. (Verified on
+                # NVIDIA GB200, driver 580.173.02: links 0-17 up, 18-35 InvalidArgument.)
                 continue
         return (
             active_links == available_links and available_links > 0
