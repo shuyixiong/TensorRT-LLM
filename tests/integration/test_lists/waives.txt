@@ -131,7 +131,6 @@ examples/test_ad_speculative_decoding.py::test_autodeploy_eagle3_one_model_accep
 examples/test_gpt.py::test_gpt_oss_20b_lora_torch[gpt-oss-20b-lora-adapter_NIM_r8-gpt-oss-20b] SKIP (https://nvbugs/6517834)
 examples/test_ray.py::test_llm_inference_distributed_ray[pp2] SKIP (https://nvbugs/6427411)
 examples/test_ray.py::test_llm_inference_distributed_ray[tp2pp2] SKIP (https://nvbugs/6427411)
-examples/test_ray.py::test_ray_disaggregated_serving[tp2] SKIP (https://nvbugs/5612502)
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2i_lpips_against_golden SKIP (https://nvbugs/6418815)
 examples/visual_gen/test_visual_gen.py::test_cosmos3_nano_t2v_lpips_against_golden SKIP (https://nvbugs/6437341)
 examples/visual_gen/test_visual_gen.py::test_ltx2_cuda_graph_trtllm_backend SKIP (https://nvbugs/6463822)
