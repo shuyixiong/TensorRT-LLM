@@ -40,6 +40,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mamba.mamba2_mixer import Mamba2Mixer
+from ..modules.mamba.mamba2_tp import validate_mamba2_tp
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -784,6 +785,20 @@ class NemotronHModel(DecoderModel):
         return hidden_states
 
 
+def _validate_mamba2_tensor_parallelism(model_config) -> None:
+    """Reject TP degrees the Mamba2 layers cannot shard.
+
+    Groups replicate across ranks when tp_size > n_groups (see mamba2_tp.py);
+    attention-DP runs the mixers unsharded, so nothing to check there.
+    """
+    if model_config.mapping.enable_attention_dp:
+        return
+    pretrained = model_config.pretrained_config
+    validate_mamba2_tp(nheads=pretrained.mamba_num_heads,
+                       n_groups=pretrained.n_groups,
+                       tp_size=model_config.mapping.tp_size)
+
+
 @register_auto_model("NemotronHPuzzleForCausalLM")
 @register_auto_model("NemotronHForCausalLM")
 class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
@@ -806,9 +821,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
 
         self._normalize_puzzle_config(model_config.pretrained_config)
 
-        if (not model_config.mapping.enable_attention_dp
-                and model_config.mapping.tp_size not in [1, 2, 4, 8]):
-            raise ValueError("TP has to be either 1, 2, 4 or 8")
+        _validate_mamba2_tensor_parallelism(model_config)
 
         num_hidden_layers = model_config.pretrained_config.num_hidden_layers
         if model_config.quant_config.exclude_modules is not None:

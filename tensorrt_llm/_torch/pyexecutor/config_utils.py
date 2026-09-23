@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, List, Optional, Protocol, Sequence, Union
 import torch
 import transformers
 
+from tensorrt_llm._torch.modules.mamba.mamba2_tp import Mamba2TpShard
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
@@ -604,9 +605,13 @@ class MambaKVCacheParams:
     def get_states_bytes_per_layer(self, mapping) -> int:
         """Return the total bytes of Mamba state per layer, used for budgeting."""
         tp_size = mamba_effective_tp_size(mapping)
-        d_inner = self.head_dim * self.num_heads
-        conv_dim = (d_inner + 2 * self.n_groups * self.state_size) // tp_size
-        nheads = self.num_heads // tp_size
+        shard = Mamba2TpShard(tp_size=tp_size,
+                              nheads=self.num_heads,
+                              n_groups=self.n_groups,
+                              head_dim=self.head_dim,
+                              d_state=self.state_size)
+        conv_dim = shard.tp_conv_dim
+        nheads = shard.tp_nheads
 
         conv_dtype = self.dtype
         ssm_dtype = (self.mamba_ssm_cache_dtype

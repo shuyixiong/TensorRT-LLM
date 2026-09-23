@@ -43,6 +43,7 @@ else:
     from typing_extensions import override
 
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLayout
+from tensorrt_llm._torch.modules.mamba.mamba2_tp import Mamba2TpShard
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _RESERVED_REQUEST_IDS,
     BlockReusePolicy,
@@ -382,22 +383,27 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
-            d_inner = mamba_head_dim * mamba_num_heads
-            grouped_state_dim = mamba_n_groups * mamba_d_state
-            conv_dim = d_inner + 2 * grouped_state_dim
-            nheads = mamba_num_heads
-            assert nheads % tp_size == 0, "mamba_num_heads must be divisible by tp_size"
-            assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
-            if kwargs.get("is_disagg", False) and grouped_state_dim % tp_size != 0:
+            shard = Mamba2TpShard(
+                tp_size=tp_size,
+                nheads=mamba_num_heads,
+                n_groups=mamba_n_groups,
+                head_dim=mamba_head_dim,
+                d_state=mamba_d_state,
+            )
+            # Replication is the only layout whose conv sections a
+            # disaggregated transfer cannot express: for every non-replicated
+            # tp_size the shard validator admits, n_groups is divisible by
+            # tp_size, hence so is each grouped section.
+            if kwargs.get("is_disagg", False) and shard.replicated:
                 raise ValueError(
-                    "Disaggregated Mamba transfer requires each convolution "
-                    "state section to be divisible by tp_size"
+                    "Disaggregated Mamba transfer does not support replicated "
+                    f"groups (tp_size={tp_size} > n_groups={mamba_n_groups})"
                 )
-            self._n_groups_per_rank = mamba_n_groups // tp_size
-            d_inner_local = d_inner // tp_size
-            grouped_state_dim_local = grouped_state_dim // tp_size
-            conv_dim = conv_dim // tp_size
-            nheads = nheads // tp_size
+            self._n_groups_per_rank = shard.tp_ngroups
+            d_inner_local = shard.tp_d_inner
+            grouped_state_dim_local = shard.tp_grouped_state_dim
+            conv_dim = shard.tp_conv_dim
+            nheads = shard.tp_nheads
             self.conv_state_shape = [conv_dim, mamba_d_conv - 1]
             self.ssm_state_shape = [nheads, mamba_head_dim, mamba_d_state]
             # TP-mismatch disaggregated transfers split the flat convolution
