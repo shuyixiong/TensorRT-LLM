@@ -2162,7 +2162,9 @@ class PyExecutor:
             req_stats.append(req_stat)
 
         for req in list(self.executor_request_queue.get_request_queue().queue):
-            if isinstance(req, RequestQueueItem):
+            if isinstance(req, RequestQueueItem) and req.is_normal_request:
+                # Control/shutdown/cancel sentinels carry negative ids that
+                # RequestStats.id (uint64) rejects.
                 req_stat = get_queued_req_stats(req.id)
                 req_stat.stage = RequestStage.QUEUED
                 req_stats.append(req_stat)

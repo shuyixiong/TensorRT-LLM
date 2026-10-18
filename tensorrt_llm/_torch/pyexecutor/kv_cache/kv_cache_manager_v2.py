@@ -1127,6 +1127,17 @@ def _settle_context_cursor(req: LlmRequest, reuse: int, tokens_per_block: int) -
     # therefore points it below KV the cache holds, and ``history_length`` cannot
     # be lowered to agree.
     reuse = max(reuse, req.py_connector_served_position)
+    # A disagg generation-init request whose cache is resumed rather than freshly
+    # matched can report the whole prompt as committed; setPrepopulatedPromptLen
+    # requires a strictly shorter prefix, as the context path guarantees by
+    # looking up only prompt_len - 1 tokens. Keep the last prompt token uncached.
+    if reuse >= req.prompt_len:
+        logger.warning(
+            f"[KVCacheManagerV2] request {req.py_request_id}: reusable prefix {reuse} "
+            f">= prompt_len {req.prompt_len} "
+            f"(disagg_gen_init={req.is_disagg_generation_init_state}); "
+            f"capping at prompt_len - 1")
+        reuse = req.prompt_len - 1
     _rewind_context_cursor(req, reuse)
     req.set_prepopulated_prompt_len(reuse, tokens_per_block)
     req.context_chunk_size = req.context_remaining_length
