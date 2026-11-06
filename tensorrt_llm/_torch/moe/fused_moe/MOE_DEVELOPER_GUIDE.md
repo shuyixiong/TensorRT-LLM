@@ -146,6 +146,8 @@ No external `Communication.dispatch` / `.combine`. Zero-token chunks still launc
 
 The DeepGEMM kernel's in-kernel barriers trap when a peer is late; their timeout is relaxed during warmup, see [Communication timeouts](#communication-timeouts).
 
+The MegaMoE CuteDSL kernel sizes its persistent grid to every co-resident cluster on the GPU, synchronizes that whole grid in-kernel, and spin-waits on peer EP ranks. A kernel on another stream that also spin-waits on peers must therefore leave it room. The main case is `TLLM_CUDA_OBJECT_COLLECTIVES=1` (the default), whose NCCL object collectives run on the executor's side stream with up to 4 CTAs (`max_ctas=4`). If such a kernel holds SMs the MegaMoE grid needs, while waiting on a rank whose MegaMoE grid cannot finish, every rank hangs; the executor shows it as a stall in a CUDA object collective or in a stream synchronize. Set `TRTLLM_CUTEDSL_SM_RESERVE` to at least that CTA count (for example 8) on every rank. `HardwareInfo.get_max_active_clusters` then returns the grid less those SMs (see `cute_dsl_utils.py`), and the MegaMoE occupancy cache keys on the reserve. With `TLLM_CUDA_OBJECT_COLLECTIVES=0` the object collectives run on the CPU (Gloo) and need no reserve, at a host cost that grows with the attention-DP size.
+
 ### Communication timeouts
 
 Several MoE communication kernels wait for their peers inside the kernel and trap once a peer is late by more than a device-side timeout. The trap is a sticky CUDA error, so every waiting rank dies. During warmup, one-time per-rank work (kernel JIT, autotuning, module loading) can delay a healthy rank by minutes with no collective in between, so these timeouts are relaxed while the engine warms up:

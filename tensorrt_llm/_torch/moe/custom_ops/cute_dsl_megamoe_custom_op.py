@@ -51,7 +51,7 @@ from tensorrt_llm._torch.autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, sm_reserve
 from tensorrt_llm._torch.utils import (
     ActivationType,
     get_last_power_of_2_num_tokens_buckets,
@@ -946,10 +946,23 @@ def _is_pow2_in_range(val: int, lo: int, hi: int) -> bool:
     return lo <= val <= hi and (val & (val - 1)) == 0
 
 
-@functools.lru_cache(maxsize=None)
 def _max_active_clusters(cluster_size: int, sm_version: Optional[int] = None) -> int:
-    """Query occupancy, keyed by cluster size and active architecture."""
-    del sm_version  # Cache-key discriminator; HardwareInfo queries the active device.
+    """Query occupancy, keyed by cluster size, active architecture and SM reserve.
+
+    ``HardwareInfo.get_max_active_clusters`` already subtracts
+    ``TRTLLM_CUTEDSL_SM_RESERVE`` (see ``cute_dsl_utils``). The reserve is part
+    of the cache key so a reserve set after the first query is not hidden.
+    """
+    return _max_active_clusters_for_reserve(cluster_size, sm_version, sm_reserve())
+
+
+@functools.lru_cache(maxsize=None)
+def _max_active_clusters_for_reserve(
+    cluster_size: int, sm_version: Optional[int], reserved_sms: int
+) -> int:
+    # sm_version and reserved_sms are cache-key discriminators; HardwareInfo
+    # queries the active device and applies the reserve itself.
+    del sm_version, reserved_sms
     import cutlass.utils as cutlass_utils
 
     return int(cutlass_utils.HardwareInfo().get_max_active_clusters(cluster_size))
