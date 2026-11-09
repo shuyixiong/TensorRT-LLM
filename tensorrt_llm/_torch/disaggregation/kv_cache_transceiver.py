@@ -122,8 +122,12 @@ def create_kv_cache_transceiver(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
-    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+    register_kv_cache: bool = True,
 ) -> Optional["KvCacheTransceiver"]:
+    """``register_kv_cache=False`` skips registering the KV cache pools with the transfer agent
+    (Python runtime only). Only the executor of the KV cache capacity estimation passes it: that
+    executor never transfers KV, and its pools are replaced right after."""
     resolve_cache_transceiver_config(cache_transceiver_config)
     lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
     bypasses_python = (cache_transceiver_config is None
@@ -224,8 +228,11 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        return KvCacheTransceiverV2(mapping,
+                                    dist,
+                                    kv_cache_manager,
+                                    cache_transceiver_config,
+                                    register_kv_cache=register_kv_cache)
 
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,

@@ -381,6 +381,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
+        register_kv_cache: bool = True,
     ):
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise ValueError(
@@ -434,13 +435,15 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._instance_name = self._broadcast_instance_name()
         logger.info(
             f"KvCacheTransceiverV2 setup: rank={rank} creating TransferWorker "
-            "(native NIXL agent init + KV memory registration)"
+            "(native NIXL agent init"
+            + (" + KV memory registration)" if register_kv_cache else ", KV memory not registered)")
         )
         self._transfer_worker = TransferWorker(
             TransferWorkerConfig(
                 kv_cache_manager=kv_cache_manager,
                 device_id=self._device_id,
                 instance_name=self._instance_name,
+                register_kv_cache=register_kv_cache,
                 # Context-only requests are released after KV transfer completes, so many batches
                 # can be in-flight simultaneously. AuxBuffer holds only small CPU metadata, so a
                 # large multiplier is cheap.

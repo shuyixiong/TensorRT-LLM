@@ -4885,6 +4885,12 @@ class TransferWorkerConfig:
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
     rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
+    # Register the KV cache pools with the transfer agent. False for the executor of the KV
+    # cache capacity estimation: it never transfers KV, and registering its throwaway pools
+    # leaves their device memory pinned after deregistration on some nodes (UCX exports every
+    # chunk as a fabric handle and registers it with the NICs), so the final KV cache allocation
+    # runs out of memory.
+    register_kv_cache: bool = True
 
 
 class TransferWorker:
@@ -5040,7 +5046,8 @@ class TransferWorker:
             )
         self._registered_mem: list = []
         try:
-            self._register_kv_cache()
+            if self._config.register_kv_cache:
+                self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
             self._sender = Sender(

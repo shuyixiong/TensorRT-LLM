@@ -4820,6 +4820,7 @@ def create_py_executor_resources(
     dwdp_manager: Optional[DwdpManager] = None,
     dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
+    register_kv_cache_with_transceiver: bool = True,
 ) -> PyExecutorResources:
     """Build the resource graph shared by initial execution and rebinding."""
     # Reject a live phase before changing global dispatch state, mutating the
@@ -5220,8 +5221,13 @@ def create_py_executor_resources(
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
+        mapping,
+        dist,
+        kv_cache_manager,
+        attention_type,
+        cache_transceiver_config,
+        mamba_cache_manager,
+        register_kv_cache=register_kv_cache_with_transceiver)
 
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
@@ -5283,6 +5289,7 @@ def create_py_executor_instance(
     dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
     transfer_budget_is_explicit: bool = False,
+    register_kv_cache_with_transceiver: bool = True,
 ) -> PyExecutor:
     execution_resources = create_py_executor_resources(
         dist=dist,
@@ -5305,6 +5312,7 @@ def create_py_executor_instance(
         dwdp_manager=dwdp_manager,
         dense_dwdp_manager=dense_dwdp_manager,
         max_num_sequences=max_num_sequences,
+        register_kv_cache_with_transceiver=register_kv_cache_with_transceiver,
     )
     # Mirror the creator's gen_preemption gate (the pools were sized against
     # the same reason): an executor that cannot pause keeps the feature off
