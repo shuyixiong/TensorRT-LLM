@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Protocol, Tuple, TypedDict, Union
 
 import torch
 from torch import nn
+from torch.utils._python_dispatch import _disable_current_modes
 
 from tensorrt_llm._torch.distributed.allreduce_helper import \
     CustomAllReduceHelper
@@ -253,15 +254,20 @@ def _make_mnnvl_mcast_buffer(comm, workspace_size_bytes: int, mapping: Mapping,
                              use_fabric_handle: bool) -> McastGPUBuffer:
     """Allocate the multicast workspace, handing C++ whichever communicator flavor we have."""
     if mpi_disabled():
-        return McastGPUBuffer(
-            workspace_size_bytes,
-            mapping.tp_size,
-            mapping.tp_rank,
-            _mnnvl_device_index(mapping),
-            use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
-            process_group=comm,
-            pybind11_abi=torch_pybind11_abi(),
-        )
+        # The ProcessGroup flavor exchanges handles through Gloo on host tensors, which go through
+        # the dispatcher. Workspaces are created while the model may be under MetaInitMode, which
+        # would turn those tensors into meta tensors without storage and crash Gloo, so pop the
+        # active dispatch modes for the duration of this host-side setup.
+        with _disable_current_modes():
+            return McastGPUBuffer(
+                workspace_size_bytes,
+                mapping.tp_size,
+                mapping.tp_rank,
+                _mnnvl_device_index(mapping),
+                use_fabric_handle,  # whether to use fabric handle or POSIX FD ipc
+                process_group=comm,
+                pybind11_abi=torch_pybind11_abi(),
+            )
     # Pass the pre-split MPI communicator's Fortran handle to avoid redundant splitting in C++
     return McastGPUBuffer(
         workspace_size_bytes,
