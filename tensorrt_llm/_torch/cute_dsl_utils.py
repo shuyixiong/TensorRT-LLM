@@ -15,6 +15,7 @@
 
 import functools
 import math
+import os
 import platform
 import sys
 import types
@@ -148,8 +149,35 @@ def install_cutlass_dsl_compatibility() -> None:
 # grids take the reserve as an argument from their module, which reads
 # ``sm_reserve()`` (the KDA mixer reads it at construction). Callers that
 # memoize the occupancy key it on ``sm_reserve()`` (the dense GEMM custom op
-# does).
-_sm_reserve = 0
+# and the MegaMoE custom op do).
+#
+# ``TRTLLM_CUTEDSL_SM_RESERVE=<n>`` sets the starting reserve for runs that
+# have no DWDP manager, e.g. MegaMoE with NCCL object collectives on a side
+# stream (see MOE_DEVELOPER_GUIDE.md). It is read once, when this module is
+# imported; ``set_sm_reserve`` still overrides it.
+_SM_RESERVE_ENV = "TRTLLM_CUTEDSL_SM_RESERVE"
+
+
+def _sm_reserve_from_env() -> int:
+    value = os.environ.get(_SM_RESERVE_ENV, "").strip()
+    if not value:
+        return 0
+    try:
+        reserve = int(value)
+    except ValueError:
+        raise ValueError(
+            f"{_SM_RESERVE_ENV} must be a non-negative integer, got {value!r}"
+        ) from None
+    if reserve < 0:
+        raise ValueError(
+            f"{_SM_RESERVE_ENV} must be a non-negative integer, got {value!r}")
+    return reserve
+
+
+_sm_reserve = _sm_reserve_from_env()
+if _sm_reserve:
+    logger.info(f"[cute_dsl_utils] {_SM_RESERVE_ENV}={_sm_reserve}: persistent "
+                f"grids launch with {_sm_reserve} SMs reserved")
 
 
 def set_sm_reserve(reserve: int) -> None:

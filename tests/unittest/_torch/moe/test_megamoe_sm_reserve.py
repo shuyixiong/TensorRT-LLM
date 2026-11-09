@@ -81,3 +81,19 @@ def test_launch_configuration_leaves_reserved_sms_free(
 ):
     monkeypatch.setattr(cute_dsl_utils, "_sm_reserve", reserve)
     assert megamoe_op._launch_cluster_configuration([2, 1, 1], None, 100) == expected
+
+
+@pytest.mark.parametrize("value, expected", [(None, 0), ("", 0), ("8", 8), (" 4 ", 4)])
+def test_sm_reserve_env_sets_the_starting_reserve(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("TRTLLM_CUTEDSL_SM_RESERVE", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", value)
+    assert cute_dsl_utils._sm_reserve_from_env() == expected
+
+
+@pytest.mark.parametrize("value", ["-1", "eight"])
+def test_sm_reserve_env_rejects_bad_values(monkeypatch, value):
+    monkeypatch.setenv("TRTLLM_CUTEDSL_SM_RESERVE", value)
+    with pytest.raises(ValueError, match="TRTLLM_CUTEDSL_SM_RESERVE"):
+        cute_dsl_utils._sm_reserve_from_env()
