@@ -2973,17 +2973,11 @@ class KVCacheManagerV2(BaseResourceManager):
         # across PP ranks, including fixed per-rank costs.
         if mapping.world_size > 1:
             dist = Distributed.get(mapping)
-            max_tokens = self._max_tokens_for_gpu_quota(quota, max_util_for_resume)
-            max_tokens = dist.allreduce(max_tokens, op=ReduceOp.MIN)
-            # inf max_tokens means all layers are SWA and every rank quota can
-            # fit all SWA fixed cache.
-            if not math.isinf(max_tokens):
-                # allreduce(MIN) must never increase the local quota. The
-                # token↔quota round-trip is not identity when SWA layers
-                # dominate (full_attn_size_per_token==0), so clamp to guard
-                # against a bogus inflation (nvbugs/6418103).
-                synced_quota = self._gpu_quota_for_max_tokens(max_tokens, max_util_for_resume)
-                quota = min(quota, synced_quota)
+            quota = self._sync_quota_across_ranks(
+                quota,
+                max_util_for_resume,
+                lambda value: dist.allreduce(value, op=ReduceOp.MIN),
+            )
 
         logger.info(f"KV cache manager v2 device quota set to {quota / (1 << 30)}GiB")
 
@@ -4125,6 +4119,44 @@ class KVCacheManagerV2(BaseResourceManager):
         """Tokens ``quota`` holds at ``max_util_for_resume`` once the fixed regions are taken out."""
         ratio_sized_quota = max(quota - self._fixed_region_quota(), 0)
         return self._get_max_tokens_from_quota(int(ratio_sized_quota * max_util_for_resume))
+
+    def _sync_quota_across_ranks(
+        self,
+        quota: int,
+        max_util_for_resume: float,
+        allreduce_min: Callable[[Union[int, float]], Union[int, float]],
+    ) -> int:
+        """Lower this rank's byte quota to the token capacity every rank can hold.
+
+        Capacity is compared in tokens because cache costs vary across PP ranks, including
+        fixed per-rank costs. The token<->quota round trip is not identity, so the quota is
+        changed only when another rank holds fewer tokens than this one.
+        """
+        local_tokens = self._max_tokens_for_gpu_quota(quota, max_util_for_resume)
+        max_tokens = allreduce_min(local_tokens)
+        # inf max_tokens means all layers are SWA and every rank quota can
+        # fit all SWA fixed cache.
+        if math.isinf(max_tokens) or max_tokens >= local_tokens:
+            # Every rank holds at least this rank's capacity. Converting tokens back to
+            # bytes would only lose the part of the quota the token model cannot express:
+            # for hybrid Mamba with block reuse, 0 tokens excludes every snapshot slot and
+            # leaves only the live states.
+            return quota
+        if max_tokens <= 0:
+            # Some rank cannot fit even one token under the token model, which is then too
+            # coarse to compare ranks with. Compare bytes instead.
+            synced_quota = int(allreduce_min(quota))
+            logger.warning(
+                "KV cache manager v2: the cache plan of one token does not fit some rank's "
+                f"resumable quota; syncing the byte quota instead ({synced_quota / (1 << 30)}GiB)"
+            )
+            return min(quota, synced_quota)
+        # allreduce(MIN) must never increase the local quota. The
+        # token↔quota round-trip is not identity when SWA layers
+        # dominate (full_attn_size_per_token==0), so clamp to guard
+        # against a bogus inflation (nvbugs/6418103).
+        synced_quota = self._gpu_quota_for_max_tokens(max_tokens, max_util_for_resume)
+        return min(quota, synced_quota)
 
     def _get_max_tokens_from_quota(self, quota: int) -> float:
         """Rank-local byte quota -> token capacity (GLOBAL tokens under helix)."""

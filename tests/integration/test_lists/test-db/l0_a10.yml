@@ -41,6 +41,7 @@ l0_a10:
   - unittest/_torch/sampler/test_token_ban.py
   - unittest/_torch/sampler/test_in_graph_sampling.py
   - unittest/_torch/disaggregation/test_disagg_index_mapper_early_release.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_quota_sync.py
   - unittest/_torch/pyexecutor/kv_cache/sharing
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
   - unittest/_torch/pyexecutor/kv_cache/test_helix_agg_preemption.py
