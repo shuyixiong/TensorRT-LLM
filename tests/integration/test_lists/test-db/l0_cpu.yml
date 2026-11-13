@@ -95,6 +95,8 @@ l0_cpu:
   - unittest/_torch/distributed
   # -m cpu_only selects only the marked tests here; the directory's GPU tests stay on l0_b200.
   - unittest/_torch/kv_cache_compression
+  # reset_prefix_cache releases CUDA graph padding dummies on KVCacheManagerV2: stand-in executor, no device.
+  - unittest/_torch/executor/test_reset_prefix_cache_padding_dummies.py
   # GLM routing, draft workspace setup and the MTP draft's MoE selection use CPU
   # metadata, mocked allocations and a patched draft class.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_exchange.py
