@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage one MegaMoE call's routing and NVFP4 activation into the kernel's bucket buffers."""
+"""Stage one MegaMoE call's routing and activation (NVFP4 with its scale factors, or BF16 without)
+into the kernel's bucket buffers."""
 
 import functools
 from typing import Optional
@@ -72,7 +73,8 @@ class MegaMoEStageInputsKernel:
         if cutlass.const_expr(self.act_words > 0):
             if live:
                 self.copy_row(act_src, act_dst, row, tidx, self.act_words)
-                self.copy_row(sf_src, sf_dst, row, tidx, self.sf_words)
+                if cutlass.const_expr(self.sf_words > 0):
+                    self.copy_row(sf_src, sf_dst, row, tidx, self.sf_words)
 
     @cute.jit
     def copy_row(
@@ -100,19 +102,30 @@ def _fake_rows(dtype, rows, width: int):
 def _compile_stage_inputs(top_k: int, index_dtype: torch.dtype, act_words: int, sf_words: int):
     live, rows = cute.sym_int(), cute.sym_int()
     staged = act_words > 0
+    # An unscaled (BF16) activation has no scale-factor rows.
+    scaled = staged and sf_words > 0
     return cute.compile(
         MegaMoEStageInputsKernel(top_k, act_words, sf_words),
         _fake_rows(Int32, live, top_k),
         _fake_rows(Float32, live, top_k),
         _fake_rows(Int32, live, act_words) if staged else None,
-        _fake_rows(Int32, live, sf_words) if staged else None,
+        _fake_rows(Int32, live, sf_words) if scaled else None,
         _fake_rows(_INDEX_TYPES[index_dtype], rows, top_k),
         _fake_rows(Float32, rows, top_k),
         _fake_rows(Int32, rows, act_words) if staged else None,
-        _fake_rows(Int32, rows, sf_words) if staged else None,
+        _fake_rows(Int32, rows, sf_words) if scaled else None,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--opt-level 2 --enable-tvm-ffi",
     )
+
+
+def _compact_rows(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """``t`` with row-major compact strides, which the compiled kernel checks. ``contiguous()`` is not
+    enough: it keeps the strides of a tensor with zero or one row (a zero- or one-token rank's slice of
+    a wider one), so a mismatched ``t`` is copied into a fresh compact tensor."""
+    if t is None or t.dim() != 2 or t.stride() == (t.shape[1], 1):
+        return t
+    return t.new_empty(t.shape).copy_(t)
 
 
 def stage_megamoe_inputs(
@@ -126,13 +139,18 @@ def stage_megamoe_inputs(
     sf_buffer: Optional[torch.Tensor] = None,
 ) -> None:
     """Fill a bucket's routing (and, with ``x``, activation) buffers; rows past ``num_tokens`` get
-    expert -1 and weight 0. Byte rows must be whole 32-bit words."""
+    expert -1 and weight 0. Byte rows must be whole 32-bit words. ``x_sf`` is None for an unscaled
+    (BF16) activation, which then stages no scale-factor rows."""
+    topk_idx, topk_weights = _compact_rows(topk_idx), _compact_rows(topk_weights)
+    x, x_sf = _compact_rows(x), _compact_rows(x_sf)
     act_src = sf_src = act_dst = sf_dst = None
     act_words = sf_words = 0
     if x is not None:
         act_src, act_dst = x.view(torch.int32), act_buffer.view(torch.int32)
-        sf_src, sf_dst = x_sf.view(torch.int32), sf_buffer.view(torch.int32)
-        act_words, sf_words = act_dst.shape[1], sf_dst.shape[1]
+        act_words = act_dst.shape[1]
+        if x_sf is not None:
+            sf_src, sf_dst = x_sf.view(torch.int32), sf_buffer.view(torch.int32)
+            sf_words = sf_dst.shape[1]
     _compile_stage_inputs(idx_buffer.shape[1], idx_buffer.dtype, act_words, sf_words)(
         topk_idx, topk_weights, act_src, sf_src, idx_buffer, weights_buffer, act_dst, sf_dst
     )
