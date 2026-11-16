@@ -123,7 +123,9 @@ def test_python_runtime_accepts_v2_manager(monkeypatch: pytest.MonkeyPatch) -> N
     result = transceiver_module.create_kv_cache_transceiver(None, None, manager, None, config)
 
     assert result is constructor.return_value
-    constructor.assert_called_once_with(None, None, manager, config)
+    # The factory forwards register_kv_cache (default True; only the KV-capacity estimation
+    # executor passes False so its throwaway pools are never registered with NIXL).
+    constructor.assert_called_once_with(None, None, manager, config, register_kv_cache=True)
     assert not any(
         "deprecated" in str(argument)
         for recorded in emitted.call_args_list
