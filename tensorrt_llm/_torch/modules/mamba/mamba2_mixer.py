@@ -917,10 +917,18 @@ class Mamba2Mixer(nn.Module):
                     )
             else:
                 # Non-MTP single-token decode
-                # flashinfer needs contiguous x/B/C with 128-byte alignment.
-                x_d = x_d.contiguous()
-                B_d = B_d.contiguous()
-                C_d = C_d.contiguous()
+                if self._use_flashinfer:
+                    # flashinfer reads x/B/C per batch row through
+                    # x_stride_batch etc., so the strided views of the conv
+                    # output need no copy when every row start is 16-byte
+                    # aligned.
+                    x_d = _row_aligned_or_contiguous(x_d)
+                    B_d = _row_aligned_or_contiguous(B_d)
+                    C_d = _row_aligned_or_contiguous(C_d)
+                else:
+                    x_d = x_d.contiguous()
+                    B_d = B_d.contiguous()
+                    C_d = C_d.contiguous()
                 ssu_kwargs = dict(
                     z=None,
                     dt_bias=dt_bias,
@@ -985,6 +993,24 @@ class Mamba2Mixer(nn.Module):
                         D,
                         **ssu_kwargs,
                     )
+
+
+def _row_aligned_or_contiguous(t: torch.Tensor) -> torch.Tensor:
+    """``t`` when its inner dims are packed and each batch row starts 16-byte aligned, else a copy.
+
+    The flashinfer selective-state-update kernel indexes x/B/C as
+    ``batch * stride(0) + head * dim`` and bulk-copies each row, so it needs
+    the inner dims packed and 16-byte aligned row starts, not a contiguous
+    batch dimension.
+    """
+    elem = t.element_size()
+    inner_packed = t.stride(-1) == 1 and all(
+        t.stride(i) == t.stride(i + 1) * t.shape[i + 1]
+        for i in range(1, t.dim() - 1))
+    if (inner_packed and t.data_ptr() % 16 == 0
+            and (t.stride(0) * elem) % 16 == 0):
+        return t
+    return t.contiguous()
 
 
 # We want to cache the largest indexing vector we'd ever need and mask it, vs
