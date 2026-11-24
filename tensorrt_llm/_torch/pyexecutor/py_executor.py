@@ -640,6 +640,12 @@ def _request_flag(request, name: str) -> bool:
     return bool(value)
 
 
+def _num_real_requests(scheduled_batch: ScheduledRequests) -> int:
+    """Scheduled requests that are not attention-DP pad dummies."""
+    return sum(not request.is_attention_dp_dummy
+               for request in scheduled_batch.all_requests())
+
+
 def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
     """Whether a single-rank attention-DP group can skip ADP dummy padding.
 
@@ -1314,6 +1320,13 @@ class PyExecutor:
         # to the normal forward/termination lifecycle only after every ADP rank
         # can queue; otherwise only this exact allocation is rolled back.
         self._pending_adp_dummy_request: Optional[LlmRequest] = None
+        # TLLM_ADP_REQUIRE_REAL_WORK=1: the attention-DP queue vote also
+        # requires a real (non-dummy) request on at least one rank, so an
+        # iteration in which every rank holds only pad dummies skips its
+        # forward instead of running it.
+        self._adp_require_real_work_enabled = (
+            self.enable_attention_dp
+            and os.environ.get("TLLM_ADP_REQUIRE_REAL_WORK", "0") == "1")
         self.async_transfer_manager = AsyncTransferManager(
             self.resource_manager,
             should_store_blocks=self.enable_disagg_partial_reuse_store)
@@ -4236,7 +4249,8 @@ class PyExecutor:
                     can_queue = False
                 if not can_queue:
                     self._revert_unexecuted_alloc(scheduled_batch)
-                    self._finalize_adp_dummy_allocation(False)
+                self._finalize_adp_dummy_allocation(can_queue)
+                if not can_queue:
                     logger.debug(
                         f"microbatch {microbatch_id} cannot be queued, skipping"
                     )
@@ -5395,6 +5409,11 @@ class PyExecutor:
         self._remote_tail_phase = phase
         self.scheduler.set_remote_tail_phase(phase, context_ids, generation_ids)
 
+    @property
+    def _adp_require_real_work(self) -> bool:
+        """Whether the attention-DP queue vote requires a real request on some rank."""
+        return getattr(self, "_adp_require_real_work_enabled", False)
+
     @nvtx_range("_can_queue")
     def _can_queue(self, scheduled_batch):
 
@@ -5402,6 +5421,13 @@ class PyExecutor:
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
         # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         runner = getattr(self.model_engine, "cuda_graph_runner", None)
+        if self._adp_require_real_work and (
+                self._dspark_adp_shape_cache_enabled()
+                or getattr(self, "_enable_remote_tail_adp", False)):
+            raise RuntimeError(
+                "TLLM_ADP_REQUIRE_REAL_WORK needs the ordinary or packed "
+                "attention-DP queue vote; the cached-shape and conditional "
+                "attention-DP paths decide can_queue without it")
         if self._dspark_adp_shape_cache_enabled():
             signature = (
                 int(self.iter_counter),
@@ -5452,13 +5478,23 @@ class PyExecutor:
             # forward together, but their batch sizes can differ: one CP rank
             # can pad a dummy request that its peer failed to allocate. With
             # cp_size == 1 this is the TP gather.
-            batch_sizes = self.dist.tp_cp_allgather_int64(
-                [scheduled_batch.batch_size])[:, 0]
-            can_queue = bool(batch_sizes.all())
+            if self._adp_require_real_work:
+                votes = self.dist.tp_cp_allgather_int64([
+                    scheduled_batch.batch_size,
+                    _num_real_requests(scheduled_batch)
+                ])
+                batch_sizes = votes[:, 0]
+                has_real_work = bool((votes[:, 1] > 0).any())
+            else:
+                batch_sizes = self.dist.tp_cp_allgather_int64(
+                    [scheduled_batch.batch_size])[:, 0]
+                has_real_work = True
+            can_queue = has_real_work and bool(batch_sizes.all())
             # Rows are TP-major, CP-minor. The CP peers of this DP rank decide
             # together whether to defer the previous batch.
             cp_rows = batch_sizes.reshape(-1, self.dist.cp_size)
-            can_queue_this_rank = bool(cp_rows[self.dist.tp_rank].any())
+            can_queue_this_rank = has_real_work and bool(
+                cp_rows[self.dist.tp_rank].any())
         else:
             can_queue = can_queue_this_rank = scheduled_batch.batch_size > 0
 
@@ -6637,14 +6673,19 @@ class PyExecutor:
         can_run_cuda_graph = bool(
             cuda_graph_runner._can_run_cuda_graph_batch(
                 graph_batch)) if cuda_graph_runner is not None else False
-        vectors = self.dist.allgather_ints(
-            [batch_size,
-             int(can_run_cuda_graph), graph_batch.batch_size])
+        vectors = self.dist.allgather_ints([
+            batch_size,
+            int(can_run_cuda_graph), graph_batch.batch_size,
+            _num_real_requests(scheduled_batch)
+        ])
         batch_sizes = [vector[0] for vector in vectors]
         graph_hint = [(bool(vector[1]), vector[2], SampleType.FULL.value)
                       for vector in vectors]
+        has_real_work = (not self._adp_require_real_work
+                         or any(vector[3] > 0 for vector in vectors))
 
-        self._packed_can_queue = (0 not in batch_sizes, batch_size > 0)
+        self._packed_can_queue = (has_real_work and 0 not in batch_sizes,
+                                  has_real_work and batch_size > 0)
         if cuda_graph_runner is not None:
             cuda_graph_runner.set_adp_graph_batch_hint(graph_hint)
 
@@ -10566,6 +10607,9 @@ class PyExecutor:
                         draft_kv_cache_manager.free_resources(llm_request)
                     return
             self.active_requests.append(llm_request)
+            if self._adp_require_real_work:
+                # A real-work veto must roll this dummy back.
+                self._pending_adp_dummy_request = llm_request
             return
 
         assert self._pending_adp_dummy_request is None

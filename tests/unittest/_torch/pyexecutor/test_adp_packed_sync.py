@@ -228,7 +228,10 @@ def _make_runner(group, rank, *, enabled=True):
     return runner
 
 
-def _batch(batch_size, *, can_run_cuda_graph=True):
+def _batch(batch_size, *, can_run_cuda_graph=True, num_dummies=0):
+    requests = [
+        SimpleNamespace(is_attention_dp_dummy=index < num_dummies) for index in range(batch_size)
+    ]
     return SimpleNamespace(
         batch_size=batch_size,
         can_run_cuda_graph=can_run_cuda_graph,
@@ -236,6 +239,7 @@ def _batch(batch_size, *, can_run_cuda_graph=True):
         num_generation_requests=batch_size,
         generation_requests=[None] * batch_size,
         context_requests=[],
+        all_requests=lambda: list(requests),
     )
 
 
@@ -343,9 +347,46 @@ def test_post_schedule_exchange_stashes_can_queue_and_padding_hint():
             batches[rank].batch_size,
             int(batches[rank].can_run_cuda_graph),
             batches[rank].batch_size,
+            batches[rank].batch_size,  # real (non-dummy) requests
         ]
         assert executors[rank]._packed_can_queue is None
         assert runners[rank]._adp_graph_batch_hint is None
+
+
+@pytest.mark.parametrize("require_real_work", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_queue_vote_requires_real_work_when_enabled(packed, require_real_work):
+    """TLLM_ADP_REQUIRE_REAL_WORK: a fleet of pad dummies only does not queue."""
+    group = _FakeGroup(2)
+    executors = [_make_executor(group, r, active_requests=[]) for r in range(2)]
+    for ex in executors:
+        ex._adp_require_real_work_enabled = require_real_work
+        ex._dspark_adp_shape_cache_enabled = lambda: False
+        ex.dist.tp_cp_allgather_int64 = ex.dist.tp_allgather_int64
+    cases = [
+        ([_batch(1, num_dummies=1), _batch(1, num_dummies=1)], not require_real_work),
+        ([_batch(1, num_dummies=1), _batch(2, num_dummies=0)], True),
+    ]
+    for batches, expected in cases:
+
+        def step(rank, batches=batches):
+            ex = executors[rank]
+            if packed:
+                ex._adp_post_schedule_exchange(batches[rank])
+            return ex._can_queue(batches[rank])
+
+        results = group.run([lambda r=r: step(r) for r in range(2)])
+        assert results == [(expected, expected)] * 2
+
+
+def test_real_work_vote_rejects_paths_that_skip_it():
+    group = _FakeGroup(1)
+    ex = _make_executor(group, 0, active_requests=[])
+    ex._adp_require_real_work_enabled = True
+    ex._dspark_adp_shape_cache_enabled = lambda: False
+    ex._enable_remote_tail_adp = True
+    with pytest.raises(RuntimeError, match="TLLM_ADP_REQUIRE_REAL_WORK"):
+        ex._can_queue(_batch(1))
 
 
 # ---------------------------------------------------------------------------
