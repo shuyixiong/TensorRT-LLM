@@ -469,6 +469,12 @@ class _WarpMmaFp8GemmRunner(TunableRunner):
 LOW_M_GEMM_ACTIVE = _parse_enabled()
 
 
+def low_m_gemm_enabled_in_env() -> bool:
+    """``TRTLLM_LOW_M_GEMM_BACKEND`` as the environment holds it now, which an engine's
+    ``env_overrides`` may have set after this module was imported (``LOW_M_GEMM_ACTIVE``)."""
+    return _parse_enabled()
+
+
 def low_m_gemm_takes_rows(module: Optional[torch.nn.Module], rows: int) -> bool:
     """Whether a GEMM of ``rows`` rows takes the low-M path: the global enable flag (or a dispatcher attached to
     ``module``) and the M upper bound (``_MAX_M``, or the module's own ceiling, ``LowMGemmDispatcher.limit_rows``)."""

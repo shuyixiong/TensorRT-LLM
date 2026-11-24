@@ -61,7 +61,8 @@ from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
-from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
+from ..modules.low_m_gemm import (LOW_M_GEMM_ACTIVE, low_m_gemm_enabled_in_env,
+                                   prepare_low_m_gemm)
 from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
 from ..moe.fused_moe.weight_owner import is_moe_weight_owner
@@ -1884,6 +1885,10 @@ class ModelLoader:
             f"Model loading metrics for rank {self.mapping.rank}: {metrics}")
         if LOW_M_GEMM_ACTIVE:
             prepare_low_m_gemm(model)
+        elif low_m_gemm_enabled_in_env():
+            # Set after import, by this engine's ``env_overrides``: attach with force, since the
+            # import-time flag stays off.
+            prepare_low_m_gemm(model, force=True)
         return model, moe_load_balancer
 
     def _check_gms_source_identity(self, gms_backend) -> None:
