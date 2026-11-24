@@ -124,6 +124,7 @@ from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .pp_utils import (MpiProgressPump, PPCommTag, get_with_mpi_progress,
                        make_mpi_progress_exit_hook, make_mpi_progress_pump)
+from .prefill_batch_wait import PrefillBatchWait
 from .profiling import PROFILE_START_STOP_ENV_VAR_NAME, PyExecutorProfileManager
 from .profiling import load_iteration_indexes as _load_iteration_indexes
 from .request_utils import (RequestBroadcaster,
@@ -9637,6 +9638,64 @@ class PyExecutor:
                              if getattr(req, "is_attention_dp_dummy", False))
         return num_ctx_tokens, num_gen_tokens
 
+    def _coalesce_adp_context_requests(
+            self, context_requests: list[LlmRequest],
+            generation_requests: list[LlmRequest]) -> list[LlmRequest]:
+        """Hold sparse first prefill chunks while the previous batch drains.
+
+        Opt-in through TLLM_ADP_PREFILL_BATCH_WAIT_MS (intake deadline) or
+        TLLM_ADP_PREFILL_BATCH_WAIT_DRAIN_ONLY=1, with
+        TLLM_ADP_PREFILL_BATCH_WAIT_RATIO (fraction of the fleet's
+        max_num_tokens that releases the batch at once) and
+        TLLM_ADP_PREFILL_BATCH_WAIT_ADAPTIVE. Every attention-DP rank votes
+        its readiness in one all-gather and PrefillBatchWait takes one
+        fleet-wide decision; held requests are returned to the scheduler,
+        whose growth the caller reverts. Disabled, it adds no collective.
+        """
+        if getattr(self, "is_warmup", False):
+            return context_requests
+        if not getattr(self, "_adp_prefill_batch_wait_initialized", False):
+            timeout = float(
+                os.environ.get("TLLM_ADP_PREFILL_BATCH_WAIT_MS", "0"))
+            ratio = float(
+                os.environ.get("TLLM_ADP_PREFILL_BATCH_WAIT_RATIO", "0.5"))
+            drain_only = os.environ.get(
+                "TLLM_ADP_PREFILL_BATCH_WAIT_DRAIN_ONLY", "0") == "1"
+            adaptive = os.environ.get("TLLM_ADP_PREFILL_BATCH_WAIT_ADAPTIVE",
+                                      "0") == "1"
+            enabled = timeout > 0 or drain_only
+            if enabled and (self.disable_overlap_scheduler
+                            or not self._is_kv_manager_v2
+                            or self.dist.pp_size != 1 or self.dist.cp_size != 1
+                            or self.is_encoder_decoder
+                            or getattr(self, "_enable_remote_tail_adp", False)):
+                raise ValueError(
+                    "ADP prefill batch waiting requires the overlap scheduler, "
+                    "KV cache manager V2, pp_size == cp_size == 1 and ordinary "
+                    "decoder-only attention DP")
+            self._adp_prefill_batch_wait = PrefillBatchWait(
+                timeout, ratio, drain_only=drain_only,
+                adaptive=adaptive) if enabled else None
+            self._adp_prefill_batch_wait_initialized = True
+        waiter = self._adp_prefill_batch_wait
+        if waiter is None:
+            return context_requests
+        real_context = [
+            req for req in context_requests if not req.is_attention_dp_dummy
+        ]
+        now = time.monotonic_ns()
+        votes = self.dist.tp_allgather_int64([
+            sum(req.context_chunk_size for req in real_context),
+            sum(not req.is_attention_dp_dummy for req in generation_requests),
+            int(any(not req.is_first_context_chunk for req in real_context)),
+            int(self.previous_batch is not None),
+            int(self.is_shutdown or bool(self.control_requests)),
+            waiter.elapsed_ns(now),
+        ]).tolist()
+        if waiter.should_wait(votes, self.max_num_tokens, now):
+            return []
+        return context_requests
+
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
         """
@@ -9947,9 +10006,13 @@ class PyExecutor:
             scheduled_encoder_requests)
 
         scheduled_context_requests = scheduler_output.context_requests
+        if self.enable_attention_dp:
+            scheduled_context_requests = self._coalesce_adp_context_requests(
+                scheduled_context_requests,
+                scheduler_output.generation_requests)
         if self.enable_attention_dp and self.attention_dp_enable_balance:
             scheduled_context_requests = self._balance_adp_requests(
-                scheduler_output.context_requests,
+                scheduled_context_requests,
                 scheduler_output.generation_requests)
 
         # If no generation requests, no need to wait, to avoid dead waiting
