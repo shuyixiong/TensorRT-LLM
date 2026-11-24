@@ -878,6 +878,7 @@ class DeepseekV3Gate(Linear):
         moe_backend: str = 'CUTLASS',
         use_cute_dsl_bf16_gemm: bool = False,
         locality_domain_policy: Optional[LocalityDomainPolicy] = None,
+        use_router_gemm_autotuned: bool = False,
     ):
         super().__init__(
             hidden_size,
@@ -891,6 +892,10 @@ class DeepseekV3Gate(Linear):
         )
         self._skip_layerwise_quant_config = True
         self.moe_backend = moe_backend
+        # Race the small-M warp-MMA router GEMM against dsv3_router_gemm_op per token bucket. For a
+        # router shape dsv3_router_gemm_op has no dedicated kernel for, its cuBLAS fallback splits K
+        # and adds a reduce kernel, which dominates at decode batch sizes.
+        self.use_router_gemm_autotuned = use_router_gemm_autotuned
         if moe_backend == 'TRTLLM':
             bias_dtype = torch.bfloat16
         else:
@@ -927,6 +932,11 @@ class DeepseekV3Gate(Linear):
                             torch.ops.trtllm.cute_dsl_bf16_gemm_blackwell)
             bf16_gemm_op(input_2d.contiguous(), self.weight, output)
             logits = output.view(*hidden_states.shape[:-1], n)
+        elif self.use_router_gemm_autotuned and self.weight.dtype == torch.bfloat16:
+            from ..custom_ops.torch_custom_ops import router_gemm_autotuned
+            input_2d = hidden_states.view(-1, hidden_states.shape[-1])
+            logits = router_gemm_autotuned(input_2d.contiguous(), self.weight)
+            logits = logits.view(*hidden_states.shape[:-1], logits.shape[-1])
         else:
             logits = torch.ops.trtllm.dsv3_router_gemm_op(
                 hidden_states,

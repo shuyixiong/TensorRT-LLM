@@ -162,3 +162,49 @@ def test_router_gemm_small_m_matches_reference(m, num_experts, hidden_size):
     served = router_gemm_autotuned(x, weight)
     torch.testing.assert_close(served, tuned, rtol=0, atol=0)
     torch.testing.assert_close(served, reference, rtol=1e-3, atol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available()
+                    or torch.cuda.get_device_capability() not in ((10, 0),
+                                                                  (10, 3),
+                                                                  (10, 7)),
+                    reason="The small-M kernel runs on SM100/SM103/SM107")
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 32])
+@pytest.mark.parametrize("use_router_gemm_autotuned", [False, True])
+def test_deepseekv3_gate_router_gemm_autotuned(num_tokens,
+                                               use_router_gemm_autotuned):
+    """A gate with no dedicated dsv3_router_gemm_op kernel (Nemotron-3 Ultra: 512 experts,
+    hidden 8192) gives the same FP32 logits and top-k on either router GEMM."""
+    from tensorrt_llm._torch.autotuner import AutoTuner, autotune
+    from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3Gate
+
+    num_experts, hidden_size, top_k = 512, 8192, 22
+    torch.manual_seed(0)
+    gate = DeepseekV3Gate(hidden_size,
+                          num_experts,
+                          top_k=top_k,
+                          n_group=1,
+                          topk_group=1,
+                          routed_scaling_factor=5.0,
+                          dtype=torch.bfloat16,
+                          moe_backend="TRTLLM",
+                          use_router_gemm_autotuned=use_router_gemm_autotuned).cuda()
+    with torch.no_grad():
+        gate.weight.copy_(
+            torch.randn_like(gate.weight, dtype=torch.float32).mul_(0.02))
+    x = torch.randn((num_tokens, hidden_size),
+                    dtype=torch.bfloat16,
+                    device="cuda")
+    reference = (x.double() @ gate.weight.double().t()).float()
+
+    AutoTuner.get().clear_cache()
+    with torch.inference_mode():
+        with autotune():
+            gate(x)
+        logits = gate(x)
+    assert logits.dtype == torch.float32
+    assert logits.shape == (num_tokens, num_experts)
+    torch.testing.assert_close(logits, reference, rtol=1e-3, atol=1e-4)
+    assert torch.equal(
+        logits.topk(top_k, dim=-1).indices.sort(-1).values,
+        reference.topk(top_k, dim=-1).indices.sort(-1).values)

@@ -254,6 +254,7 @@ class NemotronHMOE(nn.Module):
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend,
+            use_router_gemm_autotuned=True,
         )
 
         # MIXED_PRECISION's global quant_algo reads as unquantized, so the
