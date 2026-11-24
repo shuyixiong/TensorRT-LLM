@@ -98,6 +98,7 @@ def prepare_dummy_topk_and_hook(
     hidden_states_index: int = 2,
     local_expert_offset: int = 0,
     use_dp: bool = False,
+    tune_on_dispatched_rows: bool = False,
 ) -> Tuple[Optional[torch.Tensor], torch.Tensor, torch.Tensor, TuningConfig]:
     """
     Prepare dummy topk tensors and input pre-hook for AutoTuner profiling.
@@ -132,6 +133,14 @@ def prepare_dummy_topk_and_hook(
             all global experts (pure-EP regime). See the module-level
             distribution comment for the full framing and the
             corresponding profile-bucket math driven by `round_rule`.
+        tune_on_dispatched_rows: With `use_dp` and pre-computed top-k,
+            profile each bucket `b` on the buffer the A2A dispatch
+            actually hands this rank: `ep_size * b` rows whose top_k picks
+            span all experts, so about `top_k / ep_size` of each row's
+            picks are local. The per-expert load matches the local
+            dummy, but the row count does, too; the kernels' launch grid
+            scales with the rows, and a token tile tuned on `b` rows can
+            be about twice as slow on `ep_size * b`.
 
     Returns:
         Tuple of (routing_logits_for_tuner, topk_weights_for_tuner, topk_ids_for_tuner, tuning_config_with_hook)
@@ -345,9 +354,28 @@ def prepare_dummy_topk_and_hook(
 
     # Determine if we need dummy topk tensors (attention DP scenario)
     need_dummy_topk = (topk_weights is not None or topk_ids is not None)
+    dispatched_rows = tune_on_dispatched_rows and use_dp and need_dummy_topk
+    ep_size = max(1, num_experts // local_num_experts)
 
+    def make_dispatched_dummy_topk(
+            num_rows: int,
+            device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Distinct top_k picks per row, uniform over all experts."""
+        scores = torch.rand(num_rows, num_experts, device=device)
+        topk_ids = torch.topk(scores, top_k, dim=-1).indices.to(torch.int32)
+        topk_weights = torch.ones(num_rows,
+                                  top_k,
+                                  dtype=torch.bfloat16,
+                                  device=device)
+        return topk_weights, topk_ids
+
+    if dispatched_rows:
+        # The call's own rows already are the dispatched buffer.
+        topk_weights_for_tuner, topk_ids_for_tuner = make_dispatched_dummy_topk(
+            hidden_states.shape[0], hidden_states.device)
+        routing_logits_for_tuner = None
     # Create dummy topk tensors for attention DP scenario
-    if need_dummy_topk:
+    elif need_dummy_topk:
         # Attention DP: topk is pre-computed, no routing needed
         topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
             hidden_states.shape[0], hidden_states.device,
@@ -368,8 +396,20 @@ def prepare_dummy_topk_and_hook(
         bucket's int top-k by repeating the tuned call's rows."""
         current_num_tokens = inputs[hidden_states_index].shape[0]
 
+        if dispatched_rows:
+            hidden = inputs[hidden_states_index]
+            if hidden is not hidden_states:
+                # A profiled bucket b: grow it to the ep_size * b rows the
+                # dispatch delivers for b tokens per rank.
+                hidden = torch.randn(current_num_tokens * ep_size,
+                                     hidden.shape[1],
+                                     device=hidden.device).to(hidden.dtype)
+                inputs[hidden_states_index] = hidden
+            inputs[-2], inputs[-1] = make_dispatched_dummy_topk(
+                hidden.shape[0], hidden.device)
+            assert inputs[0] is None
         # Only recreate if we originally created dummies
-        if need_dummy_topk:
+        elif need_dummy_topk:
             if inputs[-1] is not None:
                 topk_weights_for_tuner, topk_ids_for_tuner = make_selected_dummy_topk(
                     current_num_tokens, inputs[hidden_states_index].device,
@@ -2845,6 +2885,7 @@ def bf16_moe_runner(routing_logits: Optional[torch.Tensor],
             hidden_states_index=2,
             local_expert_offset=local_expert_offset,
             use_dp=use_dp,
+            tune_on_dispatched_rows=True,
         )
 
     input_tensors_for_tuner = [
