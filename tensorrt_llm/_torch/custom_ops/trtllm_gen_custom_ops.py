@@ -2730,7 +2730,14 @@ class Bf16MoERunner(TunableRunner):
         TUNED_DIM = 0
         MAX_PROFILE_BUCKET = 8192
 
-        m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
+        # Decode batches up to 128 tokens get a bucket per multiple of 8 (exact
+        # below 8): the token tile follows tokens per expert, and between two
+        # powers of 2 the lower bucket's tile splits most experts in two, so
+        # each expert's weights are read once per tile.
+        m_values = tuple(
+            sorted(
+                set(get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET))
+                | set(range(1, 8)) | set(range(8, 129, 8))))
         if tune_max_num_tokens > MAX_PROFILE_BUCKET:
             m_values = tuple(m_values) + (tune_max_num_tokens, )
 
@@ -2741,6 +2748,10 @@ class Bf16MoERunner(TunableRunner):
             if (deflated > MAX_PROFILE_BUCKET
                     and tune_max_num_tokens > MAX_PROFILE_BUCKET):
                 return tune_max_num_tokens
+            if deflated < 8:
+                return max(1, deflated)
+            if deflated <= 128:
+                return deflated // 8 * 8
             value = last_positive_power_of_2(deflated)
             return min(max(1, value), MAX_PROFILE_BUCKET)
 
