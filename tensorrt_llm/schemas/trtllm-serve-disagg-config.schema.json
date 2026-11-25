@@ -10650,6 +10650,11 @@
       "description": "Context parallel config.",
       "status": "prototype"
     },
+    "ctx_strip_message_history": {
+      "default": false,
+      "title": "Ctx Strip Message History",
+      "type": "boolean"
+    },
     "cuda_graph_config": {
       "anyOf": [
         {
