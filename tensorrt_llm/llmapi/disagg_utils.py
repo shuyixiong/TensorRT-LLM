@@ -271,6 +271,11 @@ class DisaggServerConfig():
     # worker's request body / JSON-parse GIL cost at high concurrency. Enable
     # ONLY for text-only, non-harmony deployments (see _get_gen_request).
     gen_strip_message_history: bool = False
+    # Drop conversation history from context_only requests that already carry
+    # prompt token ids, after the context router has placed them. The context
+    # worker then prefills from the ids and never parses the history. Enable ONLY
+    # for text-only, non-harmony deployments (see _maybe_strip_ctx_message_history).
+    ctx_strip_message_history: bool = False
     # Ask context workers to return prompt_token_ids as a base64 int32 buffer so
     # the orchestrator relays a string instead of materializing the token-id list
     # on its event loop. Text-only, non-harmony deployments (see _get_ctx_request).
@@ -431,6 +436,7 @@ def extract_disagg_cfg(
                                 'generation_first'] = 'context_first',
         allow_request_chat_template: bool = False,
         gen_strip_message_history: bool = False,
+        ctx_strip_message_history: bool = False,
         gen_tokids_ctxbytes: bool = False,
         num_workers: int = 1,
         disagg_coordinator_url: Optional[str] = None,
@@ -531,6 +537,7 @@ def extract_disagg_cfg(
     config.allow_request_chat_template = validate_config_bool(
         allow_request_chat_template, "allow_request_chat_template")
     config.gen_strip_message_history = gen_strip_message_history
+    config.ctx_strip_message_history = ctx_strip_message_history
     config.gen_tokids_ctxbytes = gen_tokids_ctxbytes
     config.num_workers = num_workers
     config.disagg_coordinator_url = disagg_coordinator_url

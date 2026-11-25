@@ -177,6 +177,8 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._req_timeout_secs = req_timeout_secs
         # Opt-in body-shrink for generation_only requests; see _get_gen_request.
         self._strip_gen_message_history = config.gen_strip_message_history
+        # Opt-in body-shrink for context_only requests; see _maybe_strip_ctx_message_history.
+        self._strip_ctx_message_history = config.ctx_strip_message_history
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
         self._tokids_ctxbytes = config.gen_tokids_ctxbytes
         self._subagent_affinity_scope = config.subagent_affinity_scope
@@ -346,6 +348,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
+                self._maybe_strip_ctx_message_history(ctx_req)
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
@@ -468,6 +471,24 @@ class OpenAIDisaggregatedService(OpenAIService):
             update["conversation_params"] = request.conversation_params.model_copy()
         ctx_request = request.model_copy(update=update)
         return ctx_request
+
+    def _maybe_strip_ctx_message_history(self, ctx_req: UCompletionRequest) -> None:
+        """Keep only the last message of a placed context request that carries prompt ids.
+
+        The context worker prefills from the supplied ids, so the history only
+        costs it a JSON parse and validation of the whole conversation on its
+        request path. Call after context routing: the router keys conversation
+        affinity on the leading messages. ``ctx_req`` is a copy, so the
+        generation request keeps its messages.
+        """
+        if (
+            self._strip_ctx_message_history
+            and isinstance(ctx_req, ChatCompletionRequest)
+            and (ctx_req.prompt_token_ids_b64 is not None or ctx_req.prompt_token_ids)
+            and ctx_req.messages
+            and len(ctx_req.messages) > 1
+        ):
+            ctx_req.messages = ctx_req.messages[-1:]
 
     def _strip_gen_subagent_affinity(self, gen_req: UCompletionRequest) -> None:
         """Keep generation parent affinity only for the "both" scope."""
@@ -664,6 +685,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                 request, req_id=disagg_request_id
             )
             ctx_req = self._get_ctx_request(request, disagg_request_id)
+            self._maybe_strip_ctx_message_history(ctx_req)
         gen_req = self._get_gen_request(
             request,
             ctx_response=None,

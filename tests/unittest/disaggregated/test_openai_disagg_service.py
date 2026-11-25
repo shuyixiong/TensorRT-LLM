@@ -364,6 +364,77 @@ def test_get_ctx_request_preserves_conversation_params_on_wire():
     assert wire_request["conversation_params"]["conversation_id"] == "conv-completion"
 
 
+def _chat_with_history(**kwargs) -> ChatCompletionRequest:
+    return ChatCompletionRequest(
+        model="test-model",
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "reply"},
+            {"role": "user", "content": "last"},
+        ],
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("ids", [{"prompt_token_ids": [1, 2, 3]}, {"prompt_token_ids_b64": "AQAAAA=="}])
+def test_strip_ctx_message_history_keeps_last_message_when_ids_supplied(ids):
+    service = _make_service("context_first")
+    service._strip_ctx_message_history = True
+    request = _chat_with_history(**ids)
+
+    ctx_request = service._get_ctx_request(request, 42)
+    service._maybe_strip_ctx_message_history(ctx_request)
+
+    assert [m["content"] for m in ctx_request.messages] == ["last"]
+    assert len(request.messages) == 4
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_strip_ctx_message_history_needs_flag_and_ids(enabled):
+    service = _make_service("context_first")
+    service._strip_ctx_message_history = enabled
+    ctx_request = service._get_ctx_request(_chat_with_history(), 42)
+
+    service._maybe_strip_ctx_message_history(ctx_request)
+
+    assert len(ctx_request.messages) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("schedule_style", ["context_first", "generation_first"])
+async def test_strip_ctx_message_history_after_context_routing(monkeypatch, schedule_style):
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service(schedule_style)
+    service._strip_ctx_message_history = True
+    routed_lengths = []
+
+    async def _route(request, **_kwargs):
+        routed_lengths.append(len(request.messages))
+        return "ctx:9000", {"server_info": {}}
+
+    service._ctx_router.get_next_server = AsyncMock(side_effect=_route)
+    service._gen_router.get_next_server = AsyncMock(return_value=("gen:9001", {"server_info": {}}))
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    service._ctx_client.send_request = AsyncMock(
+        side_effect=lambda request, **_kwargs: _make_chat_response(
+            finish_reason="length", prompt_token_ids=[1, 2, 3]
+        )
+    )
+    service._gen_client.send_request = AsyncMock(
+        return_value=_make_chat_response(finish_reason="stop", prompt_token_ids=[1, 2, 3])
+    )
+
+    await service._send_disagg_request(_chat_with_history(prompt_token_ids=[1, 2, 3]))
+
+    assert routed_lengths == [4]
+    ctx_request = service._ctx_client.send_request.call_args.args[0]
+    assert [m["content"] for m in ctx_request.messages] == ["last"]
+    gen_request = service._gen_client.send_request.call_args.args[0]
+    assert len(gen_request.messages) == 4
+
+
 def test_get_ctx_request_isolates_subagent_affinity_from_gen():
     # The ctx request must carry the parent affinity key on its OWN
     # conversation_params copy, so stripping the gen request (which shares the
